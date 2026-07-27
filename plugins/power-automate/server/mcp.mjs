@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// FlowAgent MCP v2.1.0 — PPAPI fallback + Button trigger + api-version fix
+// FlowAgent MCP v2.2.0 — JSON coercion, get_flow path param, CDS fallback, callback fallback
 var __create = Object.create;
 var __defProp = Object.defineProperty;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
@@ -28491,7 +28491,17 @@ var FlowClient = class _FlowClient {
   }
   async runFlowViaCallback(envId, flowId, triggerBody, triggerName) {
     const resolvedTrigger = triggerName ?? await this.resolveTriggerName(envId, flowId);
-    const callbackUrl = await this.getTriggerCallbackUrl(envId, flowId, resolvedTrigger);
+    let callbackUrl;
+    try {
+      callbackUrl = await this.getTriggerCallbackUrl(envId, flowId, resolvedTrigger);
+    } catch (err) {
+      if (err instanceof FlowApiError && /ListCallbackUrlOperationBlocked/i.test(err.message)) {
+        logger.warn(`listCallbackUrl blocked for trigger "${resolvedTrigger}" (Button/Request trigger). Falling back to management API with body.`);
+        const result = await this.runFlow(envId, flowId, triggerBody, resolvedTrigger);
+        return { status: 202, body: result };
+      }
+      throw err;
+    }
     const headers = {
       "Content-Type": "application/json"
     };
@@ -29246,8 +29256,26 @@ var FlowClient = class _FlowClient {
         logger.warn(`PPAPI endpoint unavailable for environment ${envId} (DNS not provisioned). Falling back to classic Flow RP API.`);
         return this.classicFlowRpRequest(envId, ppapiPath, method, body);
       }
+      if (this.isCdsPermissionError(err)) {
+        logger.warn(`PPAPI returned InsufficientCdsPermissions for environment ${envId}. Falling back to classic Flow RP API (different auth path).`);
+        return this.classicFlowRpRequest(envId, ppapiPath, method, body);
+      }
       throw err;
     }
+  }
+  /** Check if an error is an InsufficientCdsPermissions response from PPAPI (403). */
+  isCdsPermissionError(err) {
+    if (!err || typeof err !== "object")
+      return false;
+    const e = err;
+    if (e.name === "FlowApiError" || e.code === "FlowApiError") {
+      const status = e.statusCode ?? e.status ?? 0;
+      if (status === 403) {
+        const msg = e.message ?? String(err);
+        return msg.includes("InsufficientCdsPermissions") || msg.includes("InsufficientPermissions");
+      }
+    }
+    return false;
   }
   /**
    * Execute a flow operation via the classic Flow RP API
@@ -29257,7 +29285,9 @@ var FlowClient = class _FlowClient {
    *   /powerautomate/flows → /providers/Microsoft.ProcessSimple/environments/{envId}/flows
    */
   async classicFlowRpRequest(envId, ppapiPath, method, body) {
-    const classicPath = ppapiPath.replace(/^\/powerautomate\//, `/providers/Microsoft.ProcessSimple/environments/${envId}/`);
+    let classicPath = ppapiPath.replace(/^\/powerautomate\//, `/providers/Microsoft.ProcessSimple/environments/${envId}/`);
+    classicPath = classicPath.replace(/api-version=1\b/, "api-version=2016-11-01");
+    classicPath = classicPath.replace(/&?addConnectorHideKey=[^&]*/g, "");
     const baseUrl = this.config.cloudEndpoints.flowBaseUrl;
     const url = `${baseUrl}${classicPath}`;
     const token = await this.auth.getAccessToken();
@@ -30267,7 +30297,7 @@ var FlowClient = class _FlowClient {
     const headers = {
       Authorization: `Bearer ${token}`,
       Accept: "application/json",
-      "User-Agent": "power-automate-plugin/2.0.0",
+      "User-Agent": "power-automate-plugin/2.2.0",
       ...extraHeaders
     };
     if (body !== void 0) {
@@ -40974,8 +41004,10 @@ init_flow_definition();
 
 // packages/core/dist/mcp/response.js
 var MAX_RESPONSE_CHARS = 5e4;
+var MAX_SINGLE_ITEM_CHARS = 2e5;
 var TRUNCATION_NOTICE = "\n\n[Response truncated. Use more specific filters or get individual items for full details.]";
-function safeResult(data) {
+var SINGLE_ITEM_TRUNCATION_NOTICE = '\n\n[Response truncated due to size. Use get_flow with a `path` parameter to retrieve specific sections, e.g. path: "definition.actions.MyAction" or path: "properties.connectionReferences".]';
+function safeResult(data, opts) {
   let text;
   try {
     if (data == null) {
@@ -40986,8 +41018,10 @@ function safeResult(data) {
   } catch {
     text = JSON.stringify({ error: "Failed to serialize response" });
   }
-  if (text.length > MAX_RESPONSE_CHARS) {
-    text = text.slice(0, MAX_RESPONSE_CHARS - TRUNCATION_NOTICE.length) + TRUNCATION_NOTICE;
+  const limit = opts?.singleItem ? MAX_SINGLE_ITEM_CHARS : MAX_RESPONSE_CHARS;
+  const notice = opts?.singleItem ? SINGLE_ITEM_TRUNCATION_NOTICE : TRUNCATION_NOTICE;
+  if (text.length > limit) {
+    text = text.slice(0, limit - notice.length) + notice;
   }
   return { content: [{ type: "text", text }] };
 }
@@ -41086,6 +41120,16 @@ function progress(extra) {
 
 // packages/core/dist/mcp/server.js
 init_backups();
+var jsonRecord = external_exports.preprocess((v) => {
+  if (typeof v === "string") {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return v;
+    }
+  }
+  return v;
+}, external_exports.record(external_exports.unknown()));
 function buildToolContext(mcpCtx, config3, clientFactory) {
   let client = null;
   function getClient() {
@@ -41359,11 +41403,29 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("get_flow", "Get a flow's full definition + connection refs + metadata. Use this when you need to inspect or modify a specific flow. For metadata across many flows, prefer list_flows (4\xD7 faster \u2014 doesn't fetch the full definition per row).", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID") }, { readOnlyHint: true, title: "Get Flow" }, async ({ env, flow }) => {
+  server2.tool("get_flow", 'Get a flow\'s full definition + connection refs + metadata. Use this when you need to inspect or modify a specific flow. For large flows, use `path` to scope the response (e.g. path: "definition.actions.MyAction" or path: "properties.connectionReferences"). For metadata across many flows, prefer list_flows (4\xD7 faster \u2014 doesn\'t fetch the full definition per row).', { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), path: external_exports.string().optional().describe('Dot-separated path to extract a sub-section of the response (e.g. "definition.actions", "properties.connectionReferences"). Omit for the full flow.') }, { readOnlyHint: true, title: "Get Flow" }, async ({ env, flow, path: subPath }) => {
     try {
       const envId = ctx.resolveEnv(env);
       ctx.rememberEnv(envId);
-      return safeResult(await ctx.getClient().getFlow(envId, flow));
+      const fullResult = await ctx.getClient().getFlow(envId, flow);
+      let result = fullResult;
+      if (subPath) {
+        for (const segment of subPath.split(".")) {
+          if (result == null || typeof result !== "object") {
+            result = void 0;
+            break;
+          }
+          if (!Object.prototype.hasOwnProperty.call(result, segment)) {
+            result = void 0;
+            break;
+          }
+          result = result[segment];
+        }
+        if (result === void 0) {
+          return safeResult({ error: `Path "${subPath}" not found in flow response. Available top-level keys: ${Object.keys(fullResult).join(", ")}` });
+        }
+      }
+      return safeResult(result, { singleItem: true });
     } catch (e) {
       return safeError(e);
     }
@@ -41377,7 +41439,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("create_flow", "Create a new cloud flow from a JSON definition. **Auto-injects** $authentication + $connections parameters if missing (most agent-built definitions forget these \u2014 wave 8 fix). Refuses by default if a flow with the same displayName already exists (returns the existing flow ID + a hint to use update_flow). Pass allowDuplicate: true only when you really want a second flow with the same name. **Best practice**: call preflight_flow first to catch missing connection refs + solution-wrap risk before creating. **Use this for**: standing up a brand-new flow. **Do NOT use for**: editing an existing flow \u2014 use update_flow instead.", { env: external_exports.string().optional().describe("Environment ID"), name: external_exports.string().describe("Flow display name"), definition: external_exports.record(external_exports.unknown()).describe("Flow definition JSON"), connectionRefs: external_exports.record(external_exports.unknown()).optional().describe("Connection references JSON"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("Initial state (default Stopped)"), allowDuplicate: external_exports.boolean().optional().describe("Bypass the no-duplicate-name guard. Default false.") }, { readOnlyHint: false, title: "Create Flow" }, async ({ env, name: name3, definition, connectionRefs, state, allowDuplicate }) => {
+  server2.tool("create_flow", "Create a new cloud flow from a JSON definition. **Auto-injects** $authentication + $connections parameters if missing (most agent-built definitions forget these \u2014 wave 8 fix). Refuses by default if a flow with the same displayName already exists (returns the existing flow ID + a hint to use update_flow). Pass allowDuplicate: true only when you really want a second flow with the same name. **Best practice**: call preflight_flow first to catch missing connection refs + solution-wrap risk before creating. **Use this for**: standing up a brand-new flow. **Do NOT use for**: editing an existing flow \u2014 use update_flow instead.", { env: external_exports.string().optional().describe("Environment ID"), name: external_exports.string().describe("Flow display name"), definition: jsonRecord.describe("Flow definition JSON"), connectionRefs: jsonRecord.optional().describe("Connection references JSON"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("Initial state (default Stopped)"), allowDuplicate: external_exports.boolean().optional().describe("Bypass the no-duplicate-name guard. Default false.") }, { readOnlyHint: false, title: "Create Flow" }, async ({ env, name: name3, definition, connectionRefs, state, allowDuplicate }) => {
     try {
       const envId = ctx.resolveEnv(env);
       ctx.rememberEnv(envId);
@@ -41395,7 +41457,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e, enhanceFlowApiError);
     }
   });
-  server2.tool("update_flow", "Update an existing flow's definition or properties. **Refuses by default if the flow lives in a managed Dataverse solution** (returns ManagedSolutionReadOnly). Pass forceManaged: true only if you understand the change will be overwritten on the next solution import \u2014 see docs/recipes/upgrade-managed-flow.md for the right pattern. **Recommended two-phase update**: call preview_update first to obtain a previewToken bound to the exact change, then pass that token back here. update_flow will only apply if the proposal still matches what was previewed (prevents lost writes from concurrent edits). Auto-captures a backup snapshot before applying (last 10 retained per flow, accessible via list_backups). **Use this for**: any change to an existing flow. **Do NOT use for**: creating a new flow (use create_flow) or starting/stopping a flow (use publish_flow / disable_flow).", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), definition: external_exports.record(external_exports.unknown()).optional().describe("Updated definition JSON"), connectionRefs: external_exports.record(external_exports.unknown()).optional().describe("Connection references JSON"), name: external_exports.string().optional().describe("New name"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("State"), forceManaged: external_exports.boolean().optional().describe("Override the managed-solution read-only guard. Default false."), previewToken: external_exports.string().optional().describe("Token issued by preview_update for this exact (env, flow, body) tuple. When supplied, the update only applies if the proposed change still matches what was previewed; mismatched tokens throw PreviewTokenMismatch.") }, { readOnlyHint: false, title: "Update Flow" }, async ({ env, flow, definition, connectionRefs, name: name3, state, forceManaged, previewToken }) => {
+  server2.tool("update_flow", "Update an existing flow's definition or properties. **Refuses by default if the flow lives in a managed Dataverse solution** (returns ManagedSolutionReadOnly). Pass forceManaged: true only if you understand the change will be overwritten on the next solution import \u2014 see docs/recipes/upgrade-managed-flow.md for the right pattern. **Recommended two-phase update**: call preview_update first to obtain a previewToken bound to the exact change, then pass that token back here. update_flow will only apply if the proposal still matches what was previewed (prevents lost writes from concurrent edits). Auto-captures a backup snapshot before applying (last 10 retained per flow, accessible via list_backups). **Use this for**: any change to an existing flow. **Do NOT use for**: creating a new flow (use create_flow) or starting/stopping a flow (use publish_flow / disable_flow).", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), definition: jsonRecord.optional().describe("Updated definition JSON"), connectionRefs: jsonRecord.optional().describe("Connection references JSON"), name: external_exports.string().optional().describe("New name"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("State"), forceManaged: external_exports.boolean().optional().describe("Override the managed-solution read-only guard. Default false."), previewToken: external_exports.string().optional().describe("Token issued by preview_update for this exact (env, flow, body) tuple. When supplied, the update only applies if the proposed change still matches what was previewed; mismatched tokens throw PreviewTokenMismatch.") }, { readOnlyHint: false, title: "Update Flow" }, async ({ env, flow, definition, connectionRefs, name: name3, state, forceManaged, previewToken }) => {
     try {
       const envId = ctx.resolveEnv(env);
       let enrichedRefs = connectionRefs;
@@ -41420,7 +41482,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e, enhanceFlowApiError);
     }
   });
-  server2.tool("preview_update", "Read-only: compute a diff between the live flow and the proposed update body, and return a short-lived single-use token. Use the token with update_flow to apply the change only if the proposal still matches what you reviewed. No mutation is performed by this tool.", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), definition: external_exports.record(external_exports.unknown()).optional().describe("Proposed updated definition JSON"), connectionRefs: external_exports.record(external_exports.unknown()).optional().describe("Proposed connection references JSON"), name: external_exports.string().optional().describe("Proposed new name"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("Proposed state") }, { readOnlyHint: true, title: "Preview Update" }, async ({ env, flow, definition, connectionRefs, name: name3, state }) => {
+  server2.tool("preview_update", "Read-only: compute a diff between the live flow and the proposed update body, and return a short-lived single-use token. Use the token with update_flow to apply the change only if the proposal still matches what you reviewed. No mutation is performed by this tool.", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), definition: jsonRecord.optional().describe("Proposed updated definition JSON"), connectionRefs: jsonRecord.optional().describe("Proposed connection references JSON"), name: external_exports.string().optional().describe("Proposed new name"), state: external_exports.enum(["Started", "Stopped"]).optional().describe("Proposed state") }, { readOnlyHint: true, title: "Preview Update" }, async ({ env, flow, definition, connectionRefs, name: name3, state }) => {
     try {
       const envId = ctx.resolveEnv(env);
       let enrichedRefs = connectionRefs;
@@ -41510,7 +41572,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("run_flow", "Trigger a manual flow run. Set wait=true to poll until completion.", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), body: external_exports.record(external_exports.unknown()).optional().describe("Trigger body JSON"), wait: external_exports.boolean().optional().describe("Wait for completion (default false)"), timeout: external_exports.number().optional().describe("Wait timeout seconds (default 60)") }, { readOnlyHint: false, title: "Run Flow" }, async ({ env, flow, body, wait, timeout }, extra) => {
+  server2.tool("run_flow", "Trigger a manual flow run. Set wait=true to poll until completion.", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Flow ID"), body: jsonRecord.optional().describe("Trigger body JSON"), wait: external_exports.boolean().optional().describe("Wait for completion (default false)"), timeout: external_exports.number().optional().describe("Wait timeout seconds (default 60)") }, { readOnlyHint: false, title: "Run Flow" }, async ({ env, flow, body, wait, timeout }, extra) => {
     try {
       const envId = ctx.resolveEnv(env);
       const c = ctx.getClient();
@@ -41697,8 +41759,8 @@ async function createMcpServer(authProvider, deps = {}) {
   });
   server2.tool("preflight_flow", "Pre-save sanity check: validate the definition + check connection-ref status + detect solution-wrap-will-block-publish risk. Use BEFORE create_flow or update_flow to catch the common failure modes (missing $authentication, broken connection ref, CannotStartUnpublishedSolutionFlow). Returns {overall: ready|warn|block, validation, connectionRefs, solutionWrap, summary[]}.", {
     env: external_exports.string().optional().describe("Environment ID"),
-    definition: external_exports.record(external_exports.unknown()).describe("The flow definition to check"),
-    connectionReferences: external_exports.record(external_exports.unknown()).optional().describe("Connection refs in flow body (same shape as create_flow)")
+    definition: jsonRecord.describe("The flow definition to check"),
+    connectionReferences: jsonRecord.optional().describe("Connection refs in flow body (same shape as create_flow)")
   }, { readOnlyHint: true, title: "Preflight Flow" }, async ({ env, definition, connectionReferences }) => {
     try {
       const envId = ctx.resolveEnv(env);
@@ -41760,7 +41822,7 @@ async function createMcpServer(authProvider, deps = {}) {
     connector: external_exports.string().describe("Connector name (e.g. shared_sharepointonline)"),
     mode: external_exports.enum(["find-or-create", "find-only", "create-only"]).optional().describe("Default: find-or-create"),
     noBrowser: external_exports.boolean().optional().describe("Don't open browser on consent (print URL instead)"),
-    params: external_exports.record(external_exports.unknown()).optional().describe("Connection parameters (e.g. for SQL: server, database)")
+    params: jsonRecord.optional().describe("Connection parameters (e.g. for SQL: server, database)")
   }, { readOnlyHint: false, title: "Pick or Create Connection" }, async ({ env, connector, mode, noBrowser, params }, extra) => {
     try {
       const envId = ctx.resolveEnv(env);
@@ -41779,7 +41841,7 @@ async function createMcpServer(authProvider, deps = {}) {
     connector: external_exports.string().describe("Connector name (e.g. shared_sharepointonline)"),
     operation: external_exports.string().describe("Operation ID (e.g. GetItems, PostMessageToChannel)"),
     connection: external_exports.string().optional().describe("Connection name; if omitted, auto-discovered via Dataverse\u2192PPAPI"),
-    currentInputs: external_exports.record(external_exports.unknown()).optional().describe("Concrete values for parent params (e.g. siteUrl, listId) so child dropdowns can resolve")
+    currentInputs: jsonRecord.optional().describe("Concrete values for parent params (e.g. siteUrl, listId) so child dropdowns can resolve")
   }, { readOnlyHint: true, title: "Resolve Connector Params" }, async ({ env, connector, operation, connection, currentInputs }, extra) => {
     try {
       const envId = ctx.resolveEnv(env);
@@ -41922,7 +41984,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("invoke_operation", "Call a connector's dynamic resolver (dropdowns, tree browsing, dynamic schemas)", { env: external_exports.string().optional().describe("Environment ID"), connector: external_exports.string().describe("Connector name"), connection: external_exports.string().describe("Connection ID"), operation: external_exports.string().describe("Operation ID"), params: external_exports.record(external_exports.unknown()).optional().describe("Parameters JSON") }, { readOnlyHint: false, title: "Invoke Operation" }, async ({ env, connector, connection, operation, params }) => {
+  server2.tool("invoke_operation", "Call a connector's dynamic resolver (dropdowns, tree browsing, dynamic schemas)", { env: external_exports.string().optional().describe("Environment ID"), connector: external_exports.string().describe("Connector name"), connection: external_exports.string().describe("Connection ID"), operation: external_exports.string().describe("Operation ID"), params: jsonRecord.optional().describe("Parameters JSON") }, { readOnlyHint: false, title: "Invoke Operation" }, async ({ env, connector, connection, operation, params }) => {
     try {
       return safeResult(await ctx.getClient().invokeOperation(ctx.resolveEnv(env), connector, connection, operation, params));
     } catch (e) {
@@ -41957,7 +42019,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("validate_flow", "Pre-validate a flow definition against PA rules", { definition: external_exports.record(external_exports.unknown()).describe("Flow definition JSON"), connectionRefs: external_exports.record(external_exports.unknown()).optional().describe("Connection references JSON") }, { readOnlyHint: true, title: "Validate Flow" }, async ({ definition, connectionRefs }) => {
+  server2.tool("validate_flow", "Pre-validate a flow definition against PA rules", { definition: jsonRecord.describe("Flow definition JSON"), connectionRefs: jsonRecord.optional().describe("Connection references JSON") }, { readOnlyHint: true, title: "Validate Flow" }, async ({ definition, connectionRefs }) => {
     try {
       const errs = validateDefinition(definition, connectionRefs);
       return safeResult(errs.length === 0 ? { valid: true } : { valid: false, errors: errs });
@@ -42009,7 +42071,7 @@ async function createMcpServer(authProvider, deps = {}) {
       return safeError(e);
     }
   });
-  server2.tool("run_desktop_flow", "Trigger a desktop flow and wait for completion", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Desktop flow ID"), machineGroup: external_exports.string().optional().describe("Machine group name or ID"), body: external_exports.record(external_exports.unknown()).optional().describe("Input data JSON"), timeout: external_exports.number().optional().describe("Timeout seconds (default 120)") }, { readOnlyHint: false, title: "Run Desktop Flow" }, async ({ env, flow, machineGroup, body, timeout }) => {
+  server2.tool("run_desktop_flow", "Trigger a desktop flow and wait for completion", { env: external_exports.string().optional().describe("Environment ID"), flow: external_exports.string().describe("Desktop flow ID"), machineGroup: external_exports.string().optional().describe("Machine group name or ID"), body: jsonRecord.optional().describe("Input data JSON"), timeout: external_exports.number().optional().describe("Timeout seconds (default 120)") }, { readOnlyHint: false, title: "Run Desktop Flow" }, async ({ env, flow, machineGroup, body, timeout }) => {
     try {
       const envId = ctx.resolveEnv(env);
       const c = ctx.getClient();

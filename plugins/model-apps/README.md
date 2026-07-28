@@ -121,6 +121,59 @@ The plugin invokes multiple tools during a session. To reduce approval prompts:
 claude --dangerously-skip-permissions
 ```
 
+## Hooks and guardrails
+
+The plugin registers lifecycle hooks (in `hooks/hooks.json`) that run automatically
+while it's loaded. They are **fail-open**: any internal error exits 0, so a hook can
+never fail or abort a skill run. Because the plugin installs **globally**, the hooks
+are scoped so they don't interfere with unrelated projects: the write-safety guard
+only **flags** (never blocks) and only during an active genpage session, and the icon
+validator only fires on genpage output. At most, the icon validator blocks a single
+tool call (the agent reworks it) — never the whole skill.
+
+| Hook | When | What it does |
+|---|---|---|
+| Write-safety | before Write/Edit/MultiEdit | **Flags (non-blocking)** writes outside the cwd — only during a genpage session (a `genpage-plan.md` at/under cwd). Never blocks; silent in unrelated projects. |
+| Icon validator | after a genpage `.tsx` write | Blocks `@fluentui/react-icons` imports that aren't in the verified list. |
+| Skill validator | after a skill runs | Runs the skill's `validate*.js` if it has one. |
+| Telemetry | on skill start / prompt | Emits anonymous `skill_started` (see [Telemetry](#telemetry)). |
+
+**Escape hatches** (environment variables — set to `1` or `true`):
+
+| Variable | Effect |
+|---|---|
+| `MODEL_APPS_DISABLE_HOOKS` | Disables **all** model-apps hooks (validators + telemetry emit). |
+| `MODEL_APPS_SKIP_WRITE_GUARD` | Disables **only** the write-safety guard (keeps the others). |
+
+```powershell
+# Windows (PowerShell)
+$env:MODEL_APPS_DISABLE_HOOKS = "1"
+```
+
+```bash
+# macOS / Linux (bash)
+export MODEL_APPS_DISABLE_HOOKS=1
+```
+
+## Telemetry
+
+model-apps ships anonymous, opt-out usage telemetry (1DS). The committed config ships
+**disabled** (`disabled: true`) — it emits nothing until go-live, even though it now
+carries the provisioned model-apps key + stream (staged, not yet enabled). `disabled:
+true` is the active guard; the placeholder-key check is only a secondary guard for
+un-provisioned copies. Once enabled it is **on by default** (you opt out).
+
+- **What's collected:** skill name, plugin/PAC/agent versions, OS/Node versions, and
+  Dataverse org/tenant GUIDs when signed in. **Never** file paths, prompts, tool
+  inputs, entity/table names, URLs, credentials, usernames, hostnames, or any
+  user-level identifier (no Entra object id).
+- **Local diagnostic mirror:** every event is also written to
+  `~/.power-platform-skills/telemetry/model-apps/sessions/<id>/events.jsonl` (even
+  when you've opted out of transmission) — hand over that one file when filing an issue.
+- **Opt out** per-user with `/model-apps:telemetry off` (re-enable with `on`, check
+  with `status`), or for CI/automation set
+  `POWER_PLATFORM_SKILLS_TELEMETRY_MODEL_APPS_OPTOUT=1` (highest precedence).
+
 ## Technology Stack
 
 - **React 17 + TypeScript** — all generated page code

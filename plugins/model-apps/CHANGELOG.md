@@ -2,7 +2,57 @@
 
 All notable changes to the **model-apps** plugin.
 
-## [Unreleased] — 2.4.0
+## [Unreleased] — 2.4.1
+
+Bug fixes for apps built on **out-of-the-box** tables, and the matching `cds-maker-sdk` uptake.
+No change to any skill's public surface.
+
+### Fixed
+- **AI app features had no effect on a newly built app** — an app-scope setting write is a no-op
+  until the app is published, so the build wrote nothing while reporting success. The write is now
+  re-issued after publish.
+- **`--verify` PASSed when AI features were skipped or never applied** — it now proves an app-scope
+  override row in `appsettings`. Reading the setting back is unsound: `RetrieveSetting` falls back
+  to the environment value when an app has no override.
+- **`ai.appFeatures` could not express non-boolean values** such as `2` ("on for everyone") — a
+  value may now be a boolean or an integer `0..1000000`.
+- **Download invented primary-name columns** (`account_name`, `contact_name` — neither exists) —
+  now read from Dataverse metadata, never synthesized. Because a spec *requires* `primaryAttribute`,
+  a table whose metadata does not supply one can no longer be emitted: a table reached from the app's
+  **navigation** now **fails** the download naming it (`--allow-lossy-download` drops it instead),
+  while a table found only as a hidden component is dropped with a warning.
+- **Download replaced the solution's publisher prefix with `new`** — now read from the solution's
+  owning publisher.
+- **Download dropped tables with no sitemap entry** — the entity set is now the sitemap set unioned
+  with tables owned by the app's view/chart/form components.
+- **Teardown could permanently burn an app's unique name** — an app is two rows (`appmodule` +
+  `sitemaps`) with no server-side cascade, so deleting only the app module stranded the sitemap and
+  reserved its name forever. Both rows are now deleted atomically in one OData `$batch`, and any
+  delete that cannot be proven refuses rather than guessing.
+- **An unreadable app produced a raw SDK throw** instead of the download's documented
+  `{ ok: false, error }`.
+
+### Changed
+- **Re-vendored `cds-maker-sdk`.** An injected `HttpClient` must now implement `postRaw` (verbatim
+  multipart body out, raw response string back) for the atomic `$batch`; without it app deletion
+  fails with `APP_DELETE_NOT_ATOMIC`. The plugin's client implements it and does not retry a
+  `$batch` — it carries record deletes, and a racing retry wedges the row.
+
+### Tests
+- 1266 → 1340 tests; coverage 92.7 → 93.9% line, 82.7 → 83.6% branch.
+- **model-apps now runs in CI** (`model-apps-script-tests`, ubuntu × windows × macos, Node 20 × 22,
+  plus the offline evals) — previously every test workflow was scoped to `plugins/power-pages/**`,
+  so this suite never ran on a PR.
+- Real-bundle suites (`ai-app-features-real-bundle`, `app-delete-real-bundle`) drive the shipped
+  vendored bundle, including one test that wires the real HTTP transport to it — the SDK's own Jest
+  suite cannot run here (Node-20-ABI `canvas`).
+
+### Known limitations
+- **Table (`entity`) app components cannot be pinned via `AddAppComponents`** — the documented shape
+  returns 204 but records a component pointing at the metadata table named `entity`. Platform defect
+  **AB#39140211**; until it is fixed a table with no sitemap entry cannot be added to an app.
+
+## 2.4.0
 
 A new **`/app-builder`** skill (Preview) that builds and edits whole model-driven apps,
 plus local-dev ergonomics, sample coverage, and an automated eval suite. Builds on v2.3;

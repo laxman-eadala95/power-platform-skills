@@ -9,26 +9,39 @@ const pluginRoot = path.resolve(__dirname, '..', '..');
 const config = JSON.parse(fs.readFileSync(path.join(pluginRoot, '.mcp.json'), 'utf8'));
 const server = config.mcpServers.playwright;
 
-function createFakeNpx(dir) {
-  const commandPath = path.join(dir, process.platform === 'win32' ? 'npx.cmd' : 'npx');
-  const script = process.platform === 'win32'
-    ? '@echo off\r\necho fake-npx %*\r\n'
-    : '#!/bin/sh\necho "fake-npx $*"\n';
-
-  fs.writeFileSync(commandPath, script, { mode: 0o755 });
-  return commandPath;
+function createSpawnPreload(dir) {
+  const preloadPath = path.join(dir, 'intercept-spawn.js');
+  fs.writeFileSync(preloadPath, `
+const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
+const realExistsSync = fs.existsSync;
+fs.existsSync = (candidate) => {
+  if (String(candidate).replaceAll('\\\\', '/').endsWith('/npm/bin/npx-cli.js')) {
+    process.stdout.write('fake-npx-cli ' + candidate + '\\n');
+    return true;
+  }
+  return realExistsSync(candidate);
+};
+require('node:child_process').spawn = (command, args, options) => {
+  process.stdout.write('fake-spawn ' + JSON.stringify({ command, args, options }) + '\\n');
+  const child = new EventEmitter();
+  process.nextTick(() => child.emit('exit', 0));
+  return child;
+};
+`);
+  return preloadPath;
 }
 
 function runBootstrap({
   cwd,
   pluginRoot: pluginRootValue,
   claudePluginRoot,
-  pathPrefix,
+  preloadPath,
   realpathOverride,
   statFailure,
 } = {}) {
   const env = { ...process.env };
-  const args = [...server.args];
+  let args = [...server.args];
   delete env.PLUGIN_ROOT;
   delete env.CLAUDE_PLUGIN_ROOT;
 
@@ -37,10 +50,6 @@ function runBootstrap({
   }
   if (claudePluginRoot !== undefined) {
     env.CLAUDE_PLUGIN_ROOT = claudePluginRoot;
-  }
-  if (pathPrefix) {
-    const pathSeparator = process.platform === 'win32' ? ';' : ':';
-    env.PATH = `${pathPrefix}${pathSeparator}${env.PATH || ''}`;
   }
   if (realpathOverride) {
     // Patch only the launcher lookup so the canonical root still follows the real filesystem.
@@ -65,6 +74,10 @@ function runBootstrap({
       "injectedFs.statSync=function(target,...options){if(require('node:path').resolve(String(target))===injectedStatTarget){const error=new Error('injected statSync failure');error.code=injectedStatCode;throw error;}return originalStatSync.call(this,target,...options);};",
     ].join(' ');
     args[bootstrapIndex] = `${prelude} ${args[bootstrapIndex]}`;
+  }
+
+  if (preloadPath) {
+    args = ['--require', preloadPath, ...args];
   }
 
   return spawnSync(server.command, args, {
@@ -228,27 +241,33 @@ test('playwright MCP bootstrap supports installed-plugin root environment conven
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'power-pages-mcp-'));
   t.after(() => fs.rmSync(tempDir, { recursive: true, force: true }));
 
-  createFakeNpx(tempDir);
+  const preloadPath = createSpawnPreload(tempDir);
 
   await t.test('PLUGIN_ROOT', () => {
     const result = runBootstrap({
       cwd: tempDir,
       pluginRoot,
-      pathPrefix: tempDir,
+      preloadPath,
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /fake-npx/);
+    assert.match(result.stdout, /fake-npx-cli/);
+    assert.match(result.stdout, /fake-spawn/);
+    assert.match(result.stdout, /--package=@playwright\/mcp@0\.0\.78/);
+    assert.match(result.stdout, /"shell":false/);
   });
 
   await t.test('CLAUDE_PLUGIN_ROOT', () => {
     const result = runBootstrap({
       cwd: tempDir,
       claudePluginRoot: pluginRoot,
-      pathPrefix: tempDir,
+      preloadPath,
     });
 
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /fake-npx/);
+    assert.match(result.stdout, /fake-npx-cli/);
+    assert.match(result.stdout, /fake-spawn/);
+    assert.match(result.stdout, /--package=@playwright\/mcp@0\.0\.78/);
+    assert.match(result.stdout, /"shell":false/);
   });
 });

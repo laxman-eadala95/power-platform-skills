@@ -28,7 +28,8 @@ Plus **`/report-issue`** to file bugs against this repo. All Dataverse mutation 
 shared, vendored SDK (`scripts/vendor/cds-maker-sdk.cjs`) — see `## Building & Testing`.
 
 **Requirements:**
-- **PAC CLI ≥ 2.7.0** — for app and generative-page deploy operations
+**Requirements:**
+- **PAC CLI > 2.10.0** — for app and generative-page deploy operations (incl. the genpage `upload` connector/Custom API flags)
 - **Azure CLI (`az`)** — Dataverse Web API auth (SDK + entity builder); must be logged in with the
   same identity as the active `pac` profile
 
@@ -369,8 +370,10 @@ agents/                        ← Agent definitions (invoked by skills via Task
   genpage-entity-builder.md    ← DV entity creation via plugin's Web API scripts (create flow)
   genpage-page-builder.md      ← Writes one .tsx file; runs in parallel for multi-page (create flow)
   genpage-edit-planner.md      ← Reads download artifacts, plans edits, writes edit plan (edit flow)
+  genpage-customapi-builder.md ← Single owner of the custom-api gate; discovers bound Custom APIs, writes ## Custom API Bindings + actions.json (create & edit flows)
 references/                    ← Shared reference docs
   rules.md                     ← Full code-gen rules, DataAPI types, layout patterns, common errors
+  custom-api.md                ← Dataverse Custom API (Action/Function) invocation contract (loaded when the plan has ## Custom API Bindings)
   connectors.md                ← GenPage connector binding contract and runtime patterns
   plan-schema.md               ← Schema contract for genpage-plan.md
   data-caching.md              ← Rule 15 on-mount fetch: de-dupe + cache (loaded conditionally)
@@ -378,7 +381,7 @@ references/                    ← Shared reference docs
   supported-dependencies.md    ← Versioned package list for generated pages
   troubleshooting.md           ← Deployment/runtime/env issues
   verified-icons.txt           ← ~5000 Fluent UI icon names; Grep-validated by page-builder
-samples/                       ← Example .tsx files (12 samples) plus app-builder spec samples
+samples/                       ← Example .tsx files (13 samples) plus app-builder spec samples
 scripts/
   launch-playwright-mcp.js     ← Playwright MCP server launcher (fullscreen; uses lib/detect-browser.js)
   playwright-mcp-fullscreen.config.json ← Fullscreen browser config for the launcher
@@ -387,6 +390,7 @@ scripts/
   dataverse-request.js         ← General Dataverse Web API wrapper (escape hatch)
   list-connections.js          ← Connector discovery: PAC connections + Dataverse connection references
   create-connection-reference.js ← Creates Dataverse connectionreference rows for connector bindings
+  list-custom-apis.js          ← Discovers bindable Custom APIs (Global + entity-bound) + parameter kinds (custom-api gated)
   add-page-to-solution.js      ← Adds GenPages and optional connection references to a solution
   provision-entities.js        ← CLI wrapper for entity provisioning (solution + data-model + sample-data)
   provision-solution.js        ← Creates a Dataverse solution via the SDK
@@ -486,6 +490,7 @@ Agents are invoked by skills via the `Task` tool — they are not user-invocable
 | `genpage-page-builder` | `genpage` (create flow) **and** `app-builder` (Phase 1.5) | Generates one complete `.tsx` page from a plan document and schema; runs in parallel with other builders for multi-page requests. `/app-builder` projects its App Spec into that plan format via `scripts/write-page-plan.js` and dispatches this same agent |
 | `genpage-edit-planner` | `genpage` (edit flow) | Reads the downloaded page artifacts (page.tsx, config.json, prompt.txt), gathers change requirements, presents edit plan, writes `genpage-edit-plan.md`. The orchestrator applies the edit inline. |
 | `genpage-connector-builder` | `genpage` orchestrator (create **and** edit flows) | **Single owner of the connectors feature gate.** Performs connector discovery (connections, connection references, datasets, tables, operations, schema), creates Dataverse connection references, and writes the `## Connector Bindings` contract + `connectors.json`. The orchestrator forwards its output into the planner or edit-planner prompt. |
+| `genpage-customapi-builder` | `genpage` orchestrator (create **and** edit flows) | **Single owner of the custom-api feature gate.** Discovers the Dataverse Custom APIs a page can bind to (Global + entity-bound Actions/Functions) plus their parameter kinds via `list-custom-apis.js`, and writes the `## Custom API Bindings` contract + `actions.json`. The orchestrator forwards its output into the planner or edit-planner prompt. |
 
 ## Key Concepts
 
@@ -526,7 +531,8 @@ values in `feature-flags.json` at the plugin root.
 - **Script backstop:** connector entrypoints call the shared
   `exitIfConnectorsDisabled()` helper (DRY — no inlined gate) and fail closed with
   exit 3 when OFF: `list-connections.js`, `create-connection-reference.js`, and the
-  `--connection-refs` branch of `add-page-to-solution.js`.
+  `--connection-refs` branch of `add-page-to-solution.js`. Custom API entrypoints call
+  the parallel `exitIfCustomApiDisabled()` helper the same way: `list-custom-apis.js`.
 - **Validation:** `KNOWN_FLAGS` + `validateFlags()` warn on unknown keys / non-boolean
   values in the committed file (so a typo can't silently do nothing, or — after a flip
   to `true` — accidentally enable the wrong thing).
@@ -579,6 +585,30 @@ entry point must go through it or the helper; the checklist of places that gate:
 The **`connectors`** flag currently ships OFF: GenPage connector support needs the
 pac CLI connector verbs (PowerPlatform-Scale-AdminTools), the GenUX authoring control
 (power-platform-ux), and the maker/admin ECS setting to all be released first.
+
+**Custom API gate — the single owner is `genpage-customapi-builder`.** Every Custom API
+entry point must go through it or the helper; the checklist of places that gate:
+
+1. Discovery — `genpage-customapi-builder` runs the probe first (planner + edit-planner
+   delegate to it; they do not gate inline).
+2. Scripts — `list-custom-apis.js` (`exitIfCustomApiDisabled`).
+3. Deploy — SKILL Phase 4.6 **re-probes** the flag and treats absent/malformed
+   `## Custom API Bindings` as no bindings (a plan authored while ON must not deploy
+   Custom API bindings after OFF).
+4. ALM — none needed: `config.json`'s `actionBindings` travels inside the page's
+   `uxagentprojectfile` rows automatically (the Custom APIs themselves are a separate
+   deployment prerequisite, bound by name).
+5. Codegen — `genpage-page-builder` emits `executeAction` / `executeFunction` /
+   `listBoundActions` code only when the plan has an actual binding table (never on an
+   absent/sentinel section).
+
+The **`custom-api`** flag currently ships OFF: GenPage Custom API invocation needs the
+AIBuilder CoderAgent action prompt, the shared `pai-gen-ux-action-runtime` plus the UCI and
+Controls host runtimes, a pac CLI `model genpage upload --actions` verb
+(PowerPlatform-Scale-AdminTools) to persist `actionBindings` into `config.json`, and the
+`GenUxPluginActionAllowList` ECS setting to all be released first. Note the maker-facing name
+is "Custom API" while the shipped wire contract stays `actionBindings` / `executeAction`
+(see `references/custom-api.md`).
 
 ## Hooks & Validators
 

@@ -358,6 +358,32 @@ function resolveChoiceValue(byLabel, v, isMulti) {
 // See docs/app-builder-design.md §7.1.
 const VALIDATION_PROFILES = ['design', 'plan', 'deploy', 'structural'];
 
+// Normalize a Dataverse language identifier (LCID) to a positive integer, or null if it is not one.
+//
+// This is the SINGLE definition used by all three entry points an LCID can arrive from, so they can
+// never disagree about what is valid: the `--language-code` CLI flag (always a string), the App Spec
+// `languageCode` field (JSON, so nominally a number but in practice anything), and a programmatic
+// caller of resolveLanguageCode().
+//
+// It deliberately does NOT use a bare `Number(value)` cast, which is far too lenient for a value that
+// is sent straight to Dataverse as a label LanguageCode:
+//   Number(true)   === 1     -> `"languageCode": true` would build every label with LCID 1
+//   Number([1033]) === 1033  -> a one-element array would silently "work"
+//   Number('1e3')  === 1000  -> exponent notation is never a real LCID
+// Each of those passes a naive positive-integer check and then fails deep inside the data-model phase
+// with an opaque Dataverse 400, instead of a clear spec/CLI error up front. Accept only a real number
+// or an all-digits string, and bound it: an LCID is a 16-bit value, so anything above 0xFFFF cannot be
+// one and would fail the same opaque way (65536, 1e20 and MAX_SAFE_INTEGER all cleared an unbounded
+// positive-integer check).
+// LCID reference: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-lcid/
+const MAX_LCID = 0xFFFF;
+function normalizeLanguageCode(value) {
+  const ok = (n) => (n > 0 && n <= MAX_LCID ? n : null);
+  if (typeof value === 'number') return Number.isInteger(value) ? ok(value) : null;
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) return ok(Number(value.trim()));
+  return null;
+}
+
 // Normalize a page's implementation source into a discriminated shape:
 //   { kind: 'tsx', codeFile } | { kind: 'intent' } | null
 // A legacy top-level `codeFile` (schemaVersion < 2) is treated as an implemented tsx page. `null`
@@ -426,6 +452,9 @@ function validateAppSpec(spec, opts = {}) {
   }
   if (!spec.app || !spec.app.name) {
     errors.push('app.name is required');
+  }
+  if (spec.languageCode !== undefined && normalizeLanguageCode(spec.languageCode) === null) {
+    errors.push('languageCode must be a positive integer LCID');
   }
   const entityNames = new Set();
   const entityByLower = new Map(); // logical (lowercased schemaName) -> entity
@@ -1253,6 +1282,7 @@ function migrateAppSpec(spec) {
 module.exports = {
   validateAppSpec,
   normalizePageSource,
+  normalizeLanguageCode,
   quickCreateEnabledFor,
   isPlatformIconRef,
   webResourceNameFromRef,

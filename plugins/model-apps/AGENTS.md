@@ -132,6 +132,27 @@ the pipeline and delegates each script's **behavioral spec** to the entries belo
   default; `--apply` writes, `--sample-data` / `--publish` opt-in (`--publish` gates the final *bulk*
   publish; edit/finalize paths — reconciling an existing form/view, form events, quick-views,
   existing-app sitemap, page finalize — still publish their one artifact so the change takes effect).
+  **DATA-MODEL Dataverse labels are stamped with the ORGANIZATION's base language, not a hardcoded
+  1033.** `resolveLanguageCode` (`scripts/lib/entity-provision.js`) reads `organization.languagecode`
+  once per build and threads it into every label-emitting SDK call in that phase (tables, columns,
+  customer columns, global choices, status reasons, alternate keys, relationships); precedence is
+  `--language-code` → App Spec `languageCode` → the org's base language → 1033. Without this, an org
+  that has not provisioned 1033 fails the data-model phase with `The language code 1033 is not a valid
+  language for this organization`
+  ([#447](https://github.com/microsoft/power-platform-skills/issues/447)) — and confusingly only on
+  *some* column types, because (observed 2026-08) Dataverse tolerates an unprovisioned LCID on
+  `EntityMetadata` and `PicklistAttributeMetadata` but rejects it on `DateTime`/`Memo`. Every fallback
+  to 1033 warns, as does an explicitly supplied LCID that had to be discarded. Note
+  `updateTable(logical, { quickCreateEnabled })` deliberately passes no language: it only builds a
+  Label when a `displayName`/`pluralName`/`description` is supplied, and otherwise round-trips
+  Dataverse's own labels under `MSCRM.MergeLabels`.
+  **Scope — this does NOT extend to the `forms`, `dashboards` or `app-shell` phases.** Those go
+  through the vendored SDK's artifact serializers, which hardcode `1033` into FormXML
+  (`<label languagecode="1033">`), SiteMap XML (`<Title LCID="1033">`) and dashboard XML with **no
+  caller override**, so the plugin cannot pass a language even though it has one. That is an SDK-side
+  gap tracked in [#455](https://github.com/microsoft/power-platform-skills/issues/455). It is not
+  known to fail a build — the #447 reporter's full build completed once the data-model phase was
+  fixed — but in a non-1033 org those labels are stored tagged with a language the org lacks.
   `--verify` (opt-in) auto-runs the read-only reconcile after a successful apply and exits non-zero on a silent partial build (the same
   check `verify-model-app.js` runs standalone). Recovery from a halted build is a full rerun (idempotent).
   **`--changed-only`** (Preview, off by default) is a fail-closed SAFE partial apply: after a FRESH
@@ -398,11 +419,11 @@ scripts/
   create-connection-reference.js ← Creates Dataverse connectionreference rows for connector bindings
   list-custom-apis.js          ← Discovers bindable Custom APIs (Global + entity-bound) + parameter kinds (custom-api gated)
   add-page-to-solution.js      ← Adds GenPages and optional connection references to a solution
-  provision-entities.js        ← CLI wrapper for entity provisioning (solution + data-model + sample-data)
+  provision-entities.js        ← CLI wrapper for entity provisioning (solution + data-model + sample-data; --language-code)
   provision-solution.js        ← Creates a Dataverse solution via the SDK
   write-page-plan.js           ← app-builder Phase 1.5: projects an App Spec into the genpage-plan.md read by page-builder workers
   promote-intent-pages.js      ← app-builder Phase 1.5: validates every generated page, then atomically flips source: intent → tsx
-  build-model-app.js           ← app-builder: narrated, idempotent SDK build (dry-run default; --stage data|ui|app|publish; --changed-only)
+  build-model-app.js           ← app-builder: narrated, idempotent SDK build (dry-run default; --stage data|ui|app|publish; --changed-only; --language-code)
   download-model-app.js        ← app-builder: pull a deployed app into an editable spec (edit flow)
   teardown-model-app.js        ← app-builder: classifier-safe reverse-of-build teardown
   verify-model-app.js          ← app-builder: reconcile the spec against the deployed app

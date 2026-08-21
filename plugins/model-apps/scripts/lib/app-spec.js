@@ -880,7 +880,25 @@ function validateAppSpec(spec, opts = {}) {
         // `entity: "account"`. Matches the chart check above, which already uses `entityByLower`.
         if (sa.entity && !entityByLower.has(String(sa.entity).toLowerCase())) errors.push(`sitemap subArea references unknown entity '${sa.entity}'`);
         if (sa.dashboard && !dashNamesSet.has(sa.dashboard)) errors.push(`sitemap subArea references unknown dashboard '${sa.dashboard}' (declare it in dashboards[])`);
-        if (sa.url && !isSafeHttpUrl(sa.url)) errors.push(`sitemap subArea "${sa.title || ''}" url must be an http(s) URL (got '${sa.url}')`);
+        // A sitemap URL subarea is EITHER a real link OR a web-resource reference —
+        // `$webresource:<name>` (what the Site Map Designer writes for a "custom page backed by an
+        // HTML web resource") or the equivalent `/WebResources/<name>` path.
+        //
+        // A web-resource reference passes through AS-IS, exactly like a platform icon ref above,
+        // and for the same reason recorded there: it is a live/OOB value a downloaded app carries,
+        // and rejecting it broke the download→build round-trip on real apps. Requiring it to be
+        // DECLARED would re-make that mistake in a new place — the referenced resource is often
+        // managed or owned by another publisher, which download deliberately leaves as a bare
+        // reference (it exists in the target env; re-creating a foreign prefix would hard-fail a
+        // fresh build). Download still captures the CONTENT when it can safely do so, so an
+        // own-prefix unmanaged page travels with the app.
+        //
+        // This does not weaken the http(s) guard, which exists to stop an ARBITRARY scheme
+        // (`javascript:`, `file:`) becoming a nav entry in a shipped app. A web-resource reference
+        // is not arbitrary: it names a resource inside Dataverse, not a script or a local file.
+        if (sa.url && !webResourceNameFromRef(sa.url) && !isSafeHttpUrl(sa.url)) {
+          errors.push(`sitemap subArea "${sa.title || ''}" url must be an http(s) URL or a $webresource:<name> reference (got '${sa.url}')`);
+        }
         // schemaVersion 2 references pages by stable KEY; legacy specs still reference by name.
         const pageRefSet = isV2 ? pageKeysSet : pageNamesSet;
         if (sa.page && !pageRefSet.has(sa.page)) errors.push(`sitemap subArea references unknown page '${sa.page}' (declare it in pages[])`);
@@ -1307,5 +1325,6 @@ module.exports = {
   prefixedRelationshipName,
   manyToManyFor,
   manyToManySchemaName,
+  isSafeHttpUrl,
   CHART_TYPES,
 };
